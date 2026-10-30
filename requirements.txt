@@ -9,3 +9,4 @@ pandas>=2.0
 numpy
 openpyxl
 requests
+matplotlib
