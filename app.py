@@ -323,36 +323,99 @@ def popup_html(r) -> str:
     </div>"""
 
 
+@st.cache_resource(show_spinner="Menyiapkan batas kecamatan, kelurahan, dan RT seluruh kota…")
+def load_admin_geojson():
+    """GeoJSON (string) batas kecamatan, kelurahan, dan RT se-Surabaya, di-cache sekali."""
+    rt, _ = load_sls()
+    from shapely.geometry import MultiPolygon, Polygon
+
+    def rapikan(gdf):
+        """Tutup celah antar-RT (~3 m) dan buang lubang kecil supaya garis batas bersih."""
+        g = gdf.to_crs(METRIC_CRS)
+        geom = g.geometry.buffer(3).buffer(-3)
+
+        def tanpa_lubang_kecil(geo):
+            parts = geo.geoms if isinstance(geo, MultiPolygon) else [geo]
+            out = [Polygon(pp.exterior, [h for h in pp.interiors if Polygon(h).area > 20000])
+                   for pp in parts if pp.area > 500]
+            return MultiPolygon(out) if len(out) > 1 else (out[0] if out else geo)
+
+        g["geometry"] = geom.map(tanpa_lubang_kecil).simplify(3)
+        return g.to_crs(4326)
+
+    kel = rapikan(rt.dissolve(by=["kode_desa", "nmkec", "nmdesa"], as_index=False)
+                  [["nmkec", "nmdesa", "geometry"]])
+    kec = rapikan(rt.dissolve(by="nmkec", as_index=False)[["nmkec", "geometry"]])
+    sls = rt[["nmdesa", "nmsls", "geometry"]].copy()
+    sls["geometry"] = sls.geometry.simplify(0.00002, preserve_topology=True)  # ~2 m
+    return kec.to_json(), kel.to_json(), sls.to_json()
+
+
+def warna_grade(grades) -> dict:
+    """Sama dengan explore(column='grade', categorical=True, cmap='RdYlGn_r')."""
+    import matplotlib
+    cats = sorted(str(g) for g in grades)
+    cmap = matplotlib.colormaps["RdYlGn_r"]
+    n = len(cats)
+    return {c: matplotlib.colors.to_hex(cmap(i / (n - 1) if n > 1 else 0.0))
+            for i, c in enumerate(cats)}
+
+
+TIP_COLS = ["kecamatan", "kelurahan", "tps", "alamat_asli", "rw_pasti",
+            "rw_kandidat_valid", "grade", "level", "metode", "varian", "kategori"]
+
+
+def tooltip_html(r) -> str:
+    rows = []
+    for c in TIP_COLS:
+        if c in r.index:
+            v = r[c]
+            if v is None or (isinstance(v, float) and np.isnan(v)) or str(v).strip() == "":
+                continue
+            rows.append(f"<tr><td style='color:#666;padding-right:8px'>{c}</td>"
+                        f"<td><b>{str(v)[:80]}</b></td></tr>")
+    return f"<table style='font:12px sans-serif'>{''.join(rows)}</table>"
+
+
 def build_map(view: pd.DataFrame, rt, rw, kode_fokus, selected=None, osm=None,
-              tampil_rt=True):
+              tampil_rt=False, warna_by="Grade geocoder", grade_colors=None):
     if selected is not None and not pd.isna(selected["lat_f"]):
         center, zoom = [selected["lat_f"], selected["lon_f"]], 17
-    elif view["lat_f"].notna().any():
+    elif kode_fokus and view["lat_f"].notna().any():
         center = [view["lat_f"].median(), view["lon_f"].median()]
         zoom = 15 if len(kode_fokus) <= 1 else 13
     else:
-        center, zoom = [-7.2575, 112.7521], 12
+        center, zoom = [-7.2650, 112.7300], 12   # seluruh Surabaya
 
     m = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True)
-    folium.TileLayer(
-        "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-        attr="&copy; OpenStreetMap &copy; CARTO", name="Peta terang").add_to(m)
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
-    folium.TileLayer(
-        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri", name="Citra satelit").add_to(m)
+    esri = "https://server.arcgisonline.com/ArcGIS/rest/services/{}/MapServer/tile/{{z}}/{{y}}/{{x}}"
+    folium.TileLayer(esri.format("Canvas/World_Light_Gray_Base"), attr="Esri",
+                     name="Abu-abu (Esri)", max_zoom=19, max_native_zoom=16).add_to(m)
+    folium.TileLayer(esri.format("World_Street_Map"), attr="Esri",
+                     name="Jalan (Esri)", max_zoom=19, show=False).add_to(m)
+    folium.TileLayer(esri.format("World_Imagery"), attr="Esri",
+                     name="Satelit (Esri)", max_zoom=19, show=False).add_to(m)
 
+    kec_js, kel_js, sls_js = load_admin_geojson()
+
+    # Batas kecamatan & kelurahan (selalu, seluruh kota)
+    folium.GeoJson(kec_js, name="Batas kecamatan", highlight_function=None,
+                   style_function=lambda f: {"color": "#222", "weight": 2.5, "fill": False},
+                   tooltip=folium.GeoJsonTooltip(["nmkec"], aliases=["Kecamatan"])).add_to(m)
+    folium.GeoJson(kel_js, name="Batas kelurahan",
+                   style_function=lambda f: {"color": "#555", "weight": 1.2, "fillOpacity": 0},
+                   tooltip=folium.GeoJsonTooltip(["nmkec", "nmdesa"],
+                                                 aliases=["Kecamatan", "Kelurahan"])).add_to(m)
+
+    # Batas RT/SLS seluruh kota (default disembunyikan, centang di tombol layer)
+    folium.GeoJson(sls_js, name="Batas SLS (RT)", show=tampil_rt,
+                   style_function=lambda f: {"color": "#999", "weight": 0.5,
+                                             "dashArray": "3 3", "fillOpacity": 0},
+                   tooltip=folium.GeoJsonTooltip(["nmdesa", "nmsls"],
+                                                 aliases=["Kelurahan", "SLS"])).add_to(m)
+
+    # Batas RW untuk kelurahan yang sedang difokuskan
     rw_sel = rw[rw["kode_desa"].isin(kode_fokus)]
-    rt_sel = rt[rt["kode_desa"].isin(kode_fokus)]
-
-    if tampil_rt and len(rt_sel):
-        folium.GeoJson(
-            rt_sel[["nmdesa", "nmsls", "geometry"]], name="Batas RT",
-            style_function=lambda f: {"color": "#9a9a92", "weight": 0.7,
-                                      "fillOpacity": 0, "dashArray": "3 3"},
-            tooltip=folium.GeoJsonTooltip(["nmdesa", "nmsls"], aliases=["Kelurahan", "SLS"]),
-        ).add_to(m)
-
     if len(rw_sel):
         rw_show = rw_sel.assign(label=lambda d: "RW " + d["rw"].astype(str).str.zfill(2))
         folium.GeoJson(
@@ -363,7 +426,6 @@ def build_map(view: pd.DataFrame, rt, rw, kode_fokus, selected=None, osm=None,
             tooltip=folium.GeoJsonTooltip(["nmdesa", "label", "jumlah_rt"],
                                           aliases=["Kelurahan", "RW", "Jumlah RT"]),
         ).add_to(m)
-        # label RW di tengah poligon
         lbl = folium.FeatureGroup(name="Label RW")
         for r in rw_show.itertuples():
             p = r.geometry.representative_point()
@@ -375,7 +437,7 @@ def build_map(view: pd.DataFrame, rt, rw, kode_fokus, selected=None, osm=None,
                                          f'{r.label}</div>')).add_to(lbl)
         lbl.add_to(m)
 
-    # Sorot RW harapan untuk TPS terpilih + garis ke batas terdekat
+    # Sorot RW harapan TPS terpilih + garis ke batas terdekat
     if selected is not None and selected["rw_harap_ada"]:
         target = rw[(rw["kode_desa"] == selected["kode_desa_harap"])
                     & (rw["rw"] == int(selected["rw_harap"]))]
@@ -396,22 +458,26 @@ def build_map(view: pd.DataFrame, rt, rw, kode_fokus, selected=None, osm=None,
                 color="#1f6feb", weight=2, dash_array="6 4",
                 tooltip=f"{selected['jarak_ke_rw_m']:,.0f} m ke batas RW harapan").add_to(m)
 
-    # Titik TPS
-    fg = folium.FeatureGroup(name="Titik TPS (geocoder)")
+    # Titik TPS hasil geocode
+    grade_colors = grade_colors or {}
+    fg = folium.FeatureGroup(name="Titik TPS")
+    kota = not kode_fokus
     for _, r in view[view["lat_f"].notna()].iterrows():
-        info = KATEGORI[r["kategori"]]
+        if warna_by == "Grade geocoder":
+            fill = grade_colors.get(str(r.get("grade")), "#8a8a85")
+        else:
+            fill = KATEGORI[r["kategori"]]["warna"]
         is_sel = selected is not None and r.name == selected.name
         folium.CircleMarker(
             [r["lat_f"], r["lon_f"]],
-            radius=10 if is_sel else 6,
-            color="#ffffff" if not is_sel else "#1f6feb", weight=3 if is_sel else 2,
-            fill=True, fill_color=info["warna"], fill_opacity=0.95,
-            tooltip=f"TPS {r.get('tps', '')} · {r['kategori']}",
+            radius=10 if is_sel else (4 if kota else 6),
+            color="#1f6feb" if is_sel else "#ffffff", weight=3 if is_sel else 1,
+            fill=True, fill_color=fill, fill_opacity=0.9,
+            tooltip=folium.Tooltip(tooltip_html(r)),
             popup=folium.Popup(popup_html(r), max_width=340),
         ).add_to(fg)
     fg.add_to(m)
 
-    # Pembanding OSM untuk alamat_asli
     if osm is not None and selected is not None:
         lat, lon, nama = osm
         folium.Marker([lat, lon], icon=folium.Icon(color="purple", icon="home"),
@@ -421,7 +487,7 @@ def build_map(view: pd.DataFrame, rt, rw, kode_fokus, selected=None, osm=None,
             folium.PolyLine([[lat, lon], [selected["lat_f"], selected["lon_f"]]],
                             color="#7b2cbf", weight=2, dash_array="2 6").add_to(m)
 
-    folium.LayerControl(collapsed=True).add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
@@ -468,6 +534,10 @@ except Exception as e:  # noqa: BLE001
     st.error(f"Gagal menganalisis data: {e}")
     st.stop()
 
+grade_colors = (warna_grade(res["grade"].dropna().astype(str).str.strip()
+                           .replace("", np.nan).dropna().unique())
+                if "grade" in res.columns else {})
+
 # ---------------- Filter ----------------
 with st.sidebar:
     st.header("Filter")
@@ -494,7 +564,12 @@ with st.sidebar:
     if min_jarak > 0:
         sub = sub[sub["jarak_ke_rw_m"].fillna(-1) >= min_jarak]
 
-    tampil_rt = st.checkbox("Tampilkan batas RT", value=True)
+    st.header("Tampilan peta")
+    warna_by = st.radio("Warna titik TPS", ["Grade geocoder", "Kategori validasi"],
+                        index=0 if "grade" in res.columns else 1)
+    tampil_rt = st.checkbox("Batas RT seluruh kota langsung tampil", value=False,
+                            help="Bisa juga dicentang dari panel layer di peta. "
+                                 "Paling enak dilihat setelah zoom ke satu kelurahan.")
 
 # ---------------- Ringkasan ----------------
 scope = res if kec_pick == "(Semua)" else res[res[kec_col] == kec_pick]
@@ -592,22 +667,27 @@ with right:
             st.warning("Alamat tidak ditemukan di OpenStreetMap.")
 
     st.divider()
-    st.markdown("**Keterangan warna titik**")
+    st.markdown(f"**Keterangan warna titik ({warna_by.lower()})**")
+    if warna_by == "Grade geocoder":
+        leg = list(grade_colors.items()) + [("(tanpa grade)", "#8a8a85")]
+    else:
+        leg = [(k, v["warna"]) for k, v in KATEGORI.items() if k != "Tanpa koordinat"]
     st.markdown("".join(
         f'<div style="display:flex;align-items:center;gap:8px;margin:2px 0;font-size:13px">'
-        f'<span style="width:12px;height:12px;border-radius:50%;background:{v["warna"]};'
+        f'<span style="width:12px;height:12px;border-radius:50%;background:{c};'
         f'box-shadow:0 0 0 2px #fff, 0 0 0 3px rgba(0,0,0,.15)"></span>{k}</div>'
-        for k, v in KATEGORI.items() if k != "Tanpa koordinat"), unsafe_allow_html=True)
+        for k, c in leg), unsafe_allow_html=True)
     st.caption("Garis biru putus-putus: dari titik ke batas terdekat RW harapan. "
                "Area biru: RW harapan TPS terpilih.")
 
 with left:
     if not kode_fokus:
-        st.caption("Pilih kecamatan atau kelurahan di sidebar untuk menampilkan batas RT/RW.")
+        st.caption("Peta seluruh Surabaya. Centang **Batas SLS (RT)** di panel layer setelah "
+                   "zoom-in; batas RW + label muncul saat memilih kecamatan/kelurahan.")
     if selected is not None:
         kode_fokus = kode_fokus | {selected["kode_desa_harap"], selected["kode_desa_aktual"]}
         kode_fokus = {k for k in kode_fokus if isinstance(k, str)}
-    m = build_map(sub, rt, rw, kode_fokus, selected, osm, tampil_rt)
+    m = build_map(sub, rt, rw, kode_fokus, selected, osm, tampil_rt, warna_by, grade_colors)
     st_folium(m, height=640, use_container_width=True, returned_objects=[])
 
 # ---------------- Tabel & rekap ----------------
